@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin id="com.eliberty.cordova.plugin.epsonusb" version="1.0.0" xmlns:android="http://schemas.android.com/apk/res/android" xmlns="http://apache.org/cordova/ns/plugins/1.0">
+  <name>EpsonUSBPrinter</name>
+  <description>Plugin Cordova pour imprimante Epson USB</description>
+  <license>MIT</license>
+  <keywords>epson,usb,cordova,printer</keywords>
+
+  <asset src="www/epsonPrinter.js" target="js/epsonPrinter.js"/>
+
+  <platform name="android">
+    <js-module src="www/epsonPrinter.js" name="EpsonPrinter">
+      <clobbers target="window.EpsonPrinter" />
+    </js-module>
+
+    <config-file target="AndroidManifest.xml" parent="/manifest">
+      <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+      <uses-permission android:name="android.permission.MANAGE_USB" />
+      <uses-permission android:name="android.permission.USB_PERMISSION" />
+    </config-file>
+
+    <config-file target="AndroidManifest.xml" parent="/manifest/application/activity">
+      <meta-data  android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/device_filter" />
+      <meta-data  android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" android:resource="@xml/device_filter" />
+    </config-file>
+
+    <config-file target="AndroidManifest.xml" parent="/manifest/application/activity/intent-filter">
+      <action android:name="android.hardware.usb.action.USB_STATE" />
+      <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+      <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+    </config-file>
+
+    <framework src="src/android/build.gradle" custom="true" type="gradleReference" />
+
+    <source-file src="src/android/EpsonPrinterPlugin.java" target-dir="com/eliberty/cordova/plugin/epsonusb/" />
+
+    <lib-file src="epos2.jar" />
+  </platform>
+</plugin>

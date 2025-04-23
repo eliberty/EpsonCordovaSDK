@@ -1,0 +1,9 @@
+{
+  "name": "cordova-plugin-epson-usb",
+  "version": "1.0.0",
+  "description": "Plugin Cordova pour imprimante Epson USB",
+  "cordova": {
+    "id": "cordova-plugin-epson-usb",
+    "platforms": ["android"]
+  }
+}
