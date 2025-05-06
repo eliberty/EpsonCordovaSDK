@@ -4,6 +4,8 @@
   "description": "Plugin Cordova pour imprimante Epson USB",
   "cordova": {
     "id": "cordova-plugin-epson-usb",
-    "platforms": ["android"]
+    "platforms": [
+      "android"
+    ]
   }
 }
