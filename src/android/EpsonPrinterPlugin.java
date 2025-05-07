@@ -48,7 +48,6 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
             printer.beginTransaction();
 
             PrinterStatusInfo status = printer.getStatus();
-
             boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
 
             if (!isOnline) {
@@ -58,45 +57,48 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                 return;
             }
 
-            Pattern qrPattern = Pattern.compile("<QRCODE>(.*?)</QRCODE>", Pattern.DOTALL);
-            Matcher matcher = qrPattern.matcher(textToPrint);
+            Pattern pattern = Pattern.compile("(<BOLD>.*?</BOLD>)|(<QRCODE>.*?</QRCODE>)", Pattern.DOTALL);
+            Matcher matcher = pattern.matcher(textToPrint);
 
-            int currentIndex = 0;
+            int lastIndex = 0;
             while (matcher.find()) {
-                int qrStart = matcher.start();
-                int qrEnd = matcher.end();
-                String textBefore = textToPrint.substring(currentIndex, qrStart);
-
-                // Imprimer le texte AVANT la balise QR
-                if (!textBefore.isEmpty()) {
-                    printer.addTextAlign(Printer.ALIGN_CENTER);
-                    printer.addText(textBefore);
+                // Texte avant la balise
+                if (matcher.start() > lastIndex) {
+                    String before = textToPrint.substring(lastIndex, matcher.start());
+                    if (!before.isEmpty()) {
+                        printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
+                        printer.addTextAlign(Printer.ALIGN_CENTER);
+                        printer.addText(before);
+                    }
                 }
 
-                // Générer le QRCode à la place de la balise
-                String qrContent = matcher.group(1);
-                if (qrContent != null && !qrContent.isEmpty()) {
+                String match = matcher.group();
+                if (match.startsWith("<BOLD>")) {
+                    String boldText = match.substring(6, match.length() - 7);
+                    printer.addTextStyle(Printer.TRUE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
+                    printer.addTextAlign(Printer.ALIGN_CENTER);
+                    printer.addText(boldText);
+                } else if (match.startsWith("<QRCODE>")) {
+                    String qrContent = match.substring(8, match.length() - 9);
                     printer.addTextAlign(Printer.ALIGN_CENTER);
                     printer.addSymbol(qrContent, Printer.SYMBOL_QRCODE_MODEL_2,
-                            Printer.LEVEL_L,
-                            8, // size (3 to 16)
-                            1, 0);
+                            Printer.LEVEL_L, 9, 1, 0);
                 }
 
-                currentIndex = qrEnd; // Avancer l'index pour continuer après le QR
+                lastIndex = matcher.end();
             }
 
-            // Texte après le dernier QRCode
-            if (currentIndex < textToPrint.length()) {
-                String textAfter = textToPrint.substring(currentIndex);
-                if (!textAfter.isEmpty()) {
+            // Texte après la dernière balise
+            if (lastIndex < textToPrint.length()) {
+                String after = textToPrint.substring(lastIndex);
+                if (!after.isEmpty()) {
+                    printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
                     printer.addTextAlign(Printer.ALIGN_CENTER);
-                    printer.addText(textAfter + "\n");
+                    printer.addText(after);
                 }
             }
 
             printer.addCut(Printer.CUT_FEED);
-
             printer.sendData(Printer.PARAM_DEFAULT);
 
             callbackContext.success("Impression envoyée !");
@@ -113,10 +115,12 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     }
                 }
             });
+
         } catch (Epos2Exception e) {
             callbackContext.error("Erreur impression : " + e.getErrorStatus());
         }
     }
+
 
     private void isPrinterAvailable(CallbackContext callbackContext) {
         try {
