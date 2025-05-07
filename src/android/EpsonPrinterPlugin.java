@@ -75,7 +75,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                 String match = matcher.group();
                 if (match.startsWith("<BOLD>")) {
                     String boldText = match.substring(6, match.length() - 7);
-                    printer.addTextStyle(Printer.TRUE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
+                    printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.TRUE, Printer.COLOR_1);
                     printer.addTextAlign(Printer.ALIGN_CENTER);
                     printer.addText(boldText);
                 } else if (match.startsWith("<QRCODE>")) {
