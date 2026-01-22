@@ -7,6 +7,8 @@ import com.epson.epos2.printer.PrinterStatusInfo;
 
 import android.content.Context;
 import android.util.Log;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 
 import org.apache.cordova.*;
 import org.json.JSONArray;
@@ -117,14 +119,40 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
     }
 
     private void printText(CallbackContext callbackContext, String textToPrint) {
+        Printer printer = null;
+        
+        // Diagnostic USB pour debug
+        Context context = cordova.getActivity().getApplicationContext();
+        UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+        boolean epsonFound = false;
+        boolean hasPermission = false;
+        String usbDiagnostic = "";
+        
+        if (usbManager != null && usbManager.getDeviceList() != null) {
+            for (UsbDevice device : usbManager.getDeviceList().values()) {
+                usbDiagnostic += String.format("[VID:%04X PID:%04X] ", device.getVendorId(), device.getProductId());
+                if (device.getVendorId() == EPSON_VENDOR_ID) {
+                    epsonFound = true;
+                    hasPermission = usbManager.hasPermission(device);
+                }
+            }
+        }
+        if (usbDiagnostic.isEmpty()) {
+            usbDiagnostic = "Aucun périphérique USB détecté";
+        }
+        
+        final String finalUsbDiagnostic = usbDiagnostic;
+        final boolean finalEpsonFound = epsonFound;
+        final boolean finalHasPermission = hasPermission;
+        
         try {
             Log.d("EpsonPrinterPlugin", "Avant instanciation Printer");
-            Context context = cordova.getActivity().getApplicationContext();
-            Printer printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
+            printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
             Log.d("EpsonPrinterPlugin", "Printer instancié");
 
             printer.connect("USB:", Printer.PARAM_DEFAULT);
             printer.beginTransaction();
+            printer.clearCommandBuffer();
 
             PrinterStatusInfo status = printer.getStatus();
             boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
@@ -135,12 +163,14 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     error.put("code", -1);
                     error.put("message", "Imprimante hors ligne : l'imprimante est connectée mais n'est pas prête à imprimer. Vérifiez le papier, le capot et l'état de l'imprimante");
                     error.put("context", "printText");
+                    error.put("epsonDetected", finalEpsonFound);
+                    error.put("usbPermission", finalHasPermission);
+                    error.put("usbDevices", finalUsbDiagnostic);
                 } catch (JSONException e) {
                     Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
                 }
                 callbackContext.error(error);
-                printer.endTransaction();
-                printer.disconnect();
+                cleanupPrinter(printer);
                 return;
             }
 
@@ -188,7 +218,17 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
             printer.addCut(Printer.CUT_FEED);
             printer.sendData(Printer.PARAM_DEFAULT);
 
-            callbackContext.success("Impression envoyée !");
+            JSONObject success = new JSONObject();
+            try {
+                success.put("status", "sent");
+                success.put("message", "Impression envoyée");
+                success.put("epsonDetected", finalEpsonFound);
+                success.put("usbPermission", finalHasPermission);
+                success.put("usbDevices", finalUsbDiagnostic);
+            } catch (JSONException e) {
+                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
+            }
+            callbackContext.success(success);
 
             printer.setReceiveEventListener(new ReceiveListener() {
                 @Override
@@ -208,32 +248,100 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         } catch (Epos2Exception e) {
             int errorCode = e.getErrorStatus();
             Log.e("EpsonPrinterPlugin", "Erreur impression - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode));
-            callbackContext.error(createErrorResponse(errorCode, "printText"));
+            cleanupPrinter(printer);
+            
+            JSONObject error = new JSONObject();
+            try {
+                error.put("code", errorCode);
+                error.put("message", getEpsonErrorMessage(errorCode));
+                error.put("context", "printText");
+                error.put("epsonDetected", finalEpsonFound);
+                error.put("usbPermission", finalHasPermission);
+                error.put("usbDevices", finalUsbDiagnostic);
+            } catch (JSONException ex) {
+                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
+            }
+            callbackContext.error(error);
         }
     }
 
+    /**
+     * Nettoie proprement les ressources de l'imprimante pour éviter les fuites
+     */
+    private void cleanupPrinter(Printer printer) {
+        if (printer == null) return;
+        try {
+            printer.clearCommandBuffer();
+        } catch (Exception ignored) {}
+        try {
+            printer.endTransaction();
+        } catch (Exception ignored) {}
+        try {
+            printer.disconnect();
+        } catch (Exception ignored) {}
+    }
 
     private void isPrinterAvailable(CallbackContext callbackContext) {
+        // Diagnostic USB avant connexion
+        Context context = cordova.getActivity().getApplicationContext();
+        UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+        boolean epsonFound = false;
+        boolean hasPermission = false;
+        String usbDiagnostic = "";
+        
+        if (usbManager != null && usbManager.getDeviceList() != null) {
+            for (UsbDevice device : usbManager.getDeviceList().values()) {
+                usbDiagnostic += String.format("[VID:%04X PID:%04X] ", device.getVendorId(), device.getProductId());
+                if (device.getVendorId() == EPSON_VENDOR_ID) {
+                    epsonFound = true;
+                    hasPermission = usbManager.hasPermission(device);
+                    Log.d("EpsonPrinterPlugin", "Epson trouvé - VID: " + device.getVendorId() + " PID: " + device.getProductId());
+                    Log.d("EpsonPrinterPlugin", "Permission accordée: " + hasPermission);
+                }
+            }
+        }
+        
+        if (usbDiagnostic.isEmpty()) {
+            usbDiagnostic = "Aucun périphérique USB détecté";
+        }
+        Log.d("EpsonPrinterPlugin", "Diagnostic USB: " + usbDiagnostic);
+        
+        final String finalUsbDiagnostic = usbDiagnostic;
+        final boolean finalEpsonFound = epsonFound;
+        final boolean finalHasPermission = hasPermission;
+
+        Printer printer = null;
         try {
-            Printer printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, cordova.getActivity());
+            printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, cordova.getActivity());
             printer.connect("USB:", Printer.PARAM_DEFAULT);
             printer.beginTransaction();
+            printer.clearCommandBuffer();
 
             PrinterStatusInfo status = printer.getStatus();
 
             boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
 
-            printer.endTransaction();
-            printer.disconnect();
+            cleanupPrinter(printer);
 
             if (isOnline) {
-                callbackContext.success("Imprimante disponible");
+                JSONObject success = new JSONObject();
+                try {
+                    success.put("status", "online");
+                    success.put("message", "Imprimante disponible et prête");
+                    success.put("epsonDetected", finalEpsonFound);
+                    success.put("usbPermission", finalHasPermission);
+                    success.put("usbDevices", finalUsbDiagnostic);
+                } catch (JSONException e) {
+                    Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
+                }
+                callbackContext.success(success);
             } else {
                 JSONObject error = new JSONObject();
                 try {
                     error.put("code", -1);
                     error.put("message", "Imprimante hors ligne : l'imprimante est connectée mais n'est pas prête. Vérifiez qu'elle n'est pas en erreur (papier, capot ouvert, etc.)");
                     error.put("context", "isPrinterAvailable");
+                    error.put("usbDevices", finalUsbDiagnostic);
                 } catch (JSONException e) {
                     Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
                 }
@@ -243,7 +351,20 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         } catch (Epos2Exception e) {
             int errorCode = e.getErrorStatus();
             Log.e("EpsonPrinterPlugin", "Erreur vérification disponibilité - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode));
-            callbackContext.error(createErrorResponse(errorCode, "isPrinterAvailable"));
+            cleanupPrinter(printer);
+            
+            JSONObject error = new JSONObject();
+            try {
+                error.put("code", errorCode);
+                error.put("message", getEpsonErrorMessage(errorCode));
+                error.put("context", "isPrinterAvailable");
+                error.put("epsonDetected", finalEpsonFound);
+                error.put("usbPermission", finalHasPermission);
+                error.put("usbDevices", finalUsbDiagnostic);
+            } catch (JSONException ex) {
+                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
+            }
+            callbackContext.error(error);
         }
     }
 }
