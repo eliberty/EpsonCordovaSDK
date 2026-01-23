@@ -22,6 +22,9 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
 
     private static final int EPSON_VENDOR_ID = 0x04B8;
     private static final int EPSON_PRODUCT_ID = 0x0202;
+    
+    // Product IDs connus pour les imprimantes TM-T88
+    private static final int[] KNOWN_TM_T88_PIDS = {0x0202, 0x0e03, 0x0e15, 0x0e27, 0x0e28, 0x0e2a};
 
     // Codes d'erreur Epson ePOS2 SDK
     private static final int ERR_SUCCESS = 0;
@@ -127,13 +130,34 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         boolean epsonFound = false;
         boolean hasPermission = false;
         String usbDiagnostic = "";
+        int usbDeviceCount = 0;
+        int epsonProductId = 0;
+        String epsonDeviceName = "";
+        boolean isKnownTmT88 = false;
         
-        if (usbManager != null && usbManager.getDeviceList() != null) {
+        if (usbManager == null) {
+            usbDiagnostic = "UsbManager non disponible";
+            Log.e("EpsonPrinterPlugin", "UsbManager est null - service USB indisponible");
+        } else if (usbManager.getDeviceList() == null) {
+            usbDiagnostic = "Liste USB null";
+            Log.e("EpsonPrinterPlugin", "getDeviceList() retourne null");
+        } else {
+            usbDeviceCount = usbManager.getDeviceList().size();
             for (UsbDevice device : usbManager.getDeviceList().values()) {
                 usbDiagnostic += String.format("[VID:%04X PID:%04X] ", device.getVendorId(), device.getProductId());
                 if (device.getVendorId() == EPSON_VENDOR_ID) {
                     epsonFound = true;
+                    epsonProductId = device.getProductId();
+                    epsonDeviceName = device.getDeviceName();
                     hasPermission = usbManager.hasPermission(device);
+                    // Vérifier si c'est un PID connu pour TM-T88
+                    for (int knownPid : KNOWN_TM_T88_PIDS) {
+                        if (epsonProductId == knownPid) {
+                            isKnownTmT88 = true;
+                            break;
+                        }
+                    }
+                    Log.d("EpsonPrinterPlugin", "Epson trouvé - Device: " + epsonDeviceName + " PID: 0x" + Integer.toHexString(epsonProductId) + " Permission: " + hasPermission + " TM-T88 connu: " + isKnownTmT88);
                 }
             }
         }
@@ -144,9 +168,13 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         final String finalUsbDiagnostic = usbDiagnostic;
         final boolean finalEpsonFound = epsonFound;
         final boolean finalHasPermission = hasPermission;
+        final int finalUsbDeviceCount = usbDeviceCount;
+        final int finalEpsonProductId = epsonProductId;
+        final String finalEpsonDeviceName = epsonDeviceName;
+        final boolean finalIsKnownTmT88 = isKnownTmT88;
         
         try {
-            Log.d("EpsonPrinterPlugin", "Avant instanciation Printer");
+            Log.d("EpsonPrinterPlugin", "Avant instanciation Printer - USB devices: " + usbDeviceCount + ", Epson trouvé: " + epsonFound + ", Permission: " + hasPermission);
             printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
             Log.d("EpsonPrinterPlugin", "Printer instancié");
 
@@ -166,6 +194,10 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     error.put("epsonDetected", finalEpsonFound);
                     error.put("usbPermission", finalHasPermission);
                     error.put("usbDevices", finalUsbDiagnostic);
+                    error.put("usbDeviceCount", finalUsbDeviceCount);
+                    error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                    error.put("epsonDeviceName", finalEpsonDeviceName);
+                    error.put("isKnownTmT88", finalIsKnownTmT88);
                 } catch (JSONException e) {
                     Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
                 }
@@ -225,6 +257,10 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                 success.put("epsonDetected", finalEpsonFound);
                 success.put("usbPermission", finalHasPermission);
                 success.put("usbDevices", finalUsbDiagnostic);
+                success.put("usbDeviceCount", finalUsbDeviceCount);
+                success.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                success.put("epsonDeviceName", finalEpsonDeviceName);
+                success.put("isKnownTmT88", finalIsKnownTmT88);
             } catch (JSONException e) {
                 Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
             }
@@ -247,7 +283,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
 
         } catch (Epos2Exception e) {
             int errorCode = e.getErrorStatus();
-            Log.e("EpsonPrinterPlugin", "Erreur impression - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode));
+            Log.e("EpsonPrinterPlugin", "Erreur impression - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode) + " | USB devices: " + finalUsbDeviceCount + ", Epson: " + finalEpsonFound + ", Permission: " + finalHasPermission + ", DeviceName: " + finalEpsonDeviceName);
             cleanupPrinter(printer);
             
             JSONObject error = new JSONObject();
@@ -258,6 +294,10 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                 error.put("epsonDetected", finalEpsonFound);
                 error.put("usbPermission", finalHasPermission);
                 error.put("usbDevices", finalUsbDiagnostic);
+                error.put("usbDeviceCount", finalUsbDeviceCount);
+                error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                error.put("epsonDeviceName", finalEpsonDeviceName);
+                error.put("isKnownTmT88", finalIsKnownTmT88);
             } catch (JSONException ex) {
                 Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
             }
@@ -288,15 +328,35 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         boolean epsonFound = false;
         boolean hasPermission = false;
         String usbDiagnostic = "";
+        int usbDeviceCount = 0;
+        int epsonProductId = 0;
+        String epsonDeviceName = "";
+        boolean isKnownTmT88 = false;
         
-        if (usbManager != null && usbManager.getDeviceList() != null) {
+        if (usbManager == null) {
+            usbDiagnostic = "UsbManager non disponible";
+            Log.e("EpsonPrinterPlugin", "UsbManager est null - service USB indisponible");
+        } else if (usbManager.getDeviceList() == null) {
+            usbDiagnostic = "Liste USB null";
+            Log.e("EpsonPrinterPlugin", "getDeviceList() retourne null");
+        } else {
+            usbDeviceCount = usbManager.getDeviceList().size();
             for (UsbDevice device : usbManager.getDeviceList().values()) {
                 usbDiagnostic += String.format("[VID:%04X PID:%04X] ", device.getVendorId(), device.getProductId());
                 if (device.getVendorId() == EPSON_VENDOR_ID) {
                     epsonFound = true;
+                    epsonProductId = device.getProductId();
+                    epsonDeviceName = device.getDeviceName();
                     hasPermission = usbManager.hasPermission(device);
-                    Log.d("EpsonPrinterPlugin", "Epson trouvé - VID: " + device.getVendorId() + " PID: " + device.getProductId());
-                    Log.d("EpsonPrinterPlugin", "Permission accordée: " + hasPermission);
+                    // Vérifier si c'est un PID connu pour TM-T88
+                    for (int knownPid : KNOWN_TM_T88_PIDS) {
+                        if (epsonProductId == knownPid) {
+                            isKnownTmT88 = true;
+                            break;
+                        }
+                    }
+                    Log.d("EpsonPrinterPlugin", "Epson trouvé - Device: " + epsonDeviceName + " VID: 0x" + Integer.toHexString(device.getVendorId()) + " PID: 0x" + Integer.toHexString(epsonProductId));
+                    Log.d("EpsonPrinterPlugin", "Permission accordée: " + hasPermission + " | TM-T88 connu: " + isKnownTmT88);
                 }
             }
         }
@@ -304,11 +364,15 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         if (usbDiagnostic.isEmpty()) {
             usbDiagnostic = "Aucun périphérique USB détecté";
         }
-        Log.d("EpsonPrinterPlugin", "Diagnostic USB: " + usbDiagnostic);
+        Log.d("EpsonPrinterPlugin", "Diagnostic USB: " + usbDiagnostic + " | Total devices: " + usbDeviceCount);
         
         final String finalUsbDiagnostic = usbDiagnostic;
         final boolean finalEpsonFound = epsonFound;
         final boolean finalHasPermission = hasPermission;
+        final int finalUsbDeviceCount = usbDeviceCount;
+        final int finalEpsonProductId = epsonProductId;
+        final String finalEpsonDeviceName = epsonDeviceName;
+        final boolean finalIsKnownTmT88 = isKnownTmT88;
 
         Printer printer = null;
         try {
@@ -331,6 +395,10 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     success.put("epsonDetected", finalEpsonFound);
                     success.put("usbPermission", finalHasPermission);
                     success.put("usbDevices", finalUsbDiagnostic);
+                    success.put("usbDeviceCount", finalUsbDeviceCount);
+                    success.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                    success.put("epsonDeviceName", finalEpsonDeviceName);
+                    success.put("isKnownTmT88", finalIsKnownTmT88);
                 } catch (JSONException e) {
                     Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
                 }
@@ -341,7 +409,13 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     error.put("code", -1);
                     error.put("message", "Imprimante hors ligne : l'imprimante est connectée mais n'est pas prête. Vérifiez qu'elle n'est pas en erreur (papier, capot ouvert, etc.)");
                     error.put("context", "isPrinterAvailable");
+                    error.put("epsonDetected", finalEpsonFound);
+                    error.put("usbPermission", finalHasPermission);
                     error.put("usbDevices", finalUsbDiagnostic);
+                    error.put("usbDeviceCount", finalUsbDeviceCount);
+                    error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                    error.put("epsonDeviceName", finalEpsonDeviceName);
+                    error.put("isKnownTmT88", finalIsKnownTmT88);
                 } catch (JSONException e) {
                     Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
                 }
@@ -350,7 +424,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
 
         } catch (Epos2Exception e) {
             int errorCode = e.getErrorStatus();
-            Log.e("EpsonPrinterPlugin", "Erreur vérification disponibilité - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode));
+            Log.e("EpsonPrinterPlugin", "Erreur vérification disponibilité - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode) + " | USB devices: " + finalUsbDeviceCount + ", Epson: " + finalEpsonFound + ", Permission: " + finalHasPermission + ", DeviceName: " + finalEpsonDeviceName);
             cleanupPrinter(printer);
             
             JSONObject error = new JSONObject();
@@ -361,6 +435,10 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                 error.put("epsonDetected", finalEpsonFound);
                 error.put("usbPermission", finalHasPermission);
                 error.put("usbDevices", finalUsbDiagnostic);
+                error.put("usbDeviceCount", finalUsbDeviceCount);
+                error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
+                error.put("epsonDeviceName", finalEpsonDeviceName);
+                error.put("isKnownTmT88", finalIsKnownTmT88);
             } catch (JSONException ex) {
                 Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
             }
