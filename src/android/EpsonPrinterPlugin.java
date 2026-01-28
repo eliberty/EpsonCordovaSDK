@@ -599,7 +599,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
                     printerSemaphore.release();
                     return;
                 }
-            } catch (Epos2Exception e) {
+            } catch (Exception e) {
                 // Continuer malgré l'erreur - on essaiera d'imprimer quand même
             }
             
@@ -872,8 +872,11 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
                 callbackContext.error(error);
             }
 
-        } catch (Epos2Exception e) {
-            int errorCode = e.getErrorStatus();
+        } catch (Exception e) {
+            int errorCode = -1;
+            if (e instanceof Epos2Exception) {
+                errorCode = ((Epos2Exception) e).getErrorStatus();
+            }
             
             // Nettoyage en cas d'erreur
             if (testPrinter != null) {
