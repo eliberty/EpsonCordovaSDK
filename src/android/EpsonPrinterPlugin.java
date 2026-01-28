@@ -6,7 +6,6 @@ import com.epson.epos2.printer.ReceiveListener;
 import com.epson.epos2.printer.PrinterStatusInfo;
 
 import android.content.Context;
-import android.util.Log;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 
@@ -17,14 +16,46 @@ import org.json.JSONObject;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-public class EpsonPrinterPlugin extends CordovaPlugin {
+public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener {
 
     private static final int EPSON_VENDOR_ID = 0x04B8;
     private static final int EPSON_PRODUCT_ID = 0x0202;
     
     // Product IDs connus pour les imprimantes TM-T88
     private static final int[] KNOWN_TM_T88_PIDS = {0x0202, 0x0e03, 0x0e15, 0x0e27, 0x0e28, 0x0e2a};
+
+    // Instance unique de l'imprimante pour éviter les conflits
+    private Printer mPrinter = null;
+    // Sémaphore pour synchroniser l'accès à l'imprimante (1 seul permit = mutex)
+    // Contrairement à ReentrantLock, un Semaphore peut être libéré par n'importe quel thread
+    private final Semaphore printerSemaphore = new Semaphore(1, true);
+    // Callback en attente pour la réponse asynchrone
+    private volatile CallbackContext pendingCallbackContext = null;
+    // Indicateur d'état de connexion
+    private volatile boolean isConnected = false;
+    // Indicateur de transaction en cours
+    private volatile boolean isTransactionActive = false;
+    // Indicateur que le sémaphore doit être libéré dans onPtrReceive
+    private volatile boolean shouldReleaseSemaphoreInCallback = false;
+    // Timeout pour acquérir le verrou (en secondes)
+    private static final int LOCK_TIMEOUT_SECONDS = 30;
+    // Timeout de sécurité pour le callback (en secondes) - Recommandation Epson
+    private static final int CALLBACK_TIMEOUT_SECONDS = 30;
+    // Executor pour le timeout de sécurité
+    private ScheduledExecutorService timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
+    // Future pour annuler le timeout si le callback arrive à temps
+    private volatile ScheduledFuture<?> callbackTimeoutFuture = null;
+    // Indicateur que le callback a été reçu (pour éviter double nettoyage)
+    private final AtomicBoolean callbackReceived = new AtomicBoolean(false);
+    // Timestamp du dernier sendData
+    private volatile long lastSendDataTimestamp = 0;
 
     // Codes d'erreur Epson ePOS2 SDK
     private static final int ERR_SUCCESS = 0;
@@ -99,18 +130,163 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
             error.put("message", getEpsonErrorMessage(errorCode));
             error.put("context", context);
         } catch (JSONException e) {
-            Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
+            // Ignore JSON error
         }
         return error;
     }
 
+    /**
+     * Callback de réception de l'imprimante (ReceiveListener)
+     * Appelé après que sendData ait terminé l'impression
+     * ATTENTION: Ce callback est appelé sur un thread DIFFÉRENT du thread appelant
+     * 
+     * IMPORTANT (recommandation support Epson): Le nettoyage doit TOUJOURS être effectué
+     * dans cet ordre, même en cas d'erreur :
+     * 1. endTransaction()
+     * 2. disconnect()
+     * 3. clearCommandBuffer()
+     */
+    @Override
+    public void onPtrReceive(Printer printer, int code, PrinterStatusInfo status, String printJobId) {
+        // Marquer que le callback a été reçu (pour éviter double nettoyage par le timeout)
+        if (!callbackReceived.compareAndSet(false, true)) {
+            // Le callback a déjà été traité (probablement par le timeout)
+            return;
+        }
+        
+        // Annuler le timeout de sécurité car le callback est arrivé
+        if (callbackTimeoutFuture != null) {
+            callbackTimeoutFuture.cancel(false);
+            callbackTimeoutFuture = null;
+        }
+        
+        // Sauvegarder les références localement car elles peuvent être modifiées par un autre thread
+        CallbackContext callback = pendingCallbackContext;
+        pendingCallbackContext = null;
+        boolean shouldRelease = shouldReleaseSemaphoreInCallback;
+        shouldReleaseSemaphoreInCallback = false;
+        
+        // ============================================================
+        // NETTOYAGE OBLIGATOIRE (même en cas d'erreur) - Ordre Epson SDK
+        // ============================================================
+        
+        // 1. Fin de la transaction - DOIT être fait EN PREMIER
+        try {
+            if (isTransactionActive && printer != null) {
+                printer.endTransaction();
+            }
+        } catch (Epos2Exception e) {
+            // Continue cleanup
+        } finally {
+            isTransactionActive = false;
+        }
+        
+        // 2. Déconnexion
+        try {
+            if (printer != null && isConnected) {
+                printer.disconnect();
+            }
+        } catch (Epos2Exception e) {
+            // Continue cleanup
+        } finally {
+            isConnected = false;
+        }
+        
+        // 3. Vider le buffer de commandes - EN DERNIER (nettoie l'état interne du SDK)
+        try {
+            if (printer != null) {
+                printer.clearCommandBuffer();
+            }
+        } catch (Exception e) {
+            // Continue cleanup
+        }
+        
+        // ============================================================
+        // FIN DU NETTOYAGE
+        // ============================================================
+        
+        // Libérer le sémaphore si nécessaire
+        // Le Semaphore peut être libéré par n'importe quel thread (contrairement à ReentrantLock)
+        if (shouldRelease) {
+            printerSemaphore.release();
+        }
+        
+        // Notifier le résultat au JavaScript
+        if (callback != null) {
+            if (code == Printer.CODE_SUCCESS) {
+                JSONObject success = new JSONObject();
+                try {
+                    success.put("status", "printed");
+                    success.put("message", "Impression réussie");
+                    success.put("printJobId", printJobId);
+                } catch (JSONException e) {
+                    // Ignore JSON error
+                }
+                callback.success(success);
+            } else {
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", code);
+                    error.put("message", getPrintResultMessage(code));
+                    error.put("context", "onPtrReceive");
+                } catch (JSONException e) {
+                    // Ignore JSON error
+                }
+                callback.error(error);
+            }
+        }
+    }
+    
+    /**
+     * Convertit un code de résultat d'impression en message
+     */
+    private String getPrintResultMessage(int code) {
+        switch (code) {
+            case Printer.CODE_SUCCESS:
+                return "Impression réussie";
+            case Printer.CODE_PRINTING:
+                return "Impression en cours";
+            case Printer.CODE_ERR_AUTORECOVER:
+                return "Erreur récupérable automatiquement - Vérifiez l'imprimante";
+            case Printer.CODE_ERR_COVER_OPEN:
+                return "Capot ouvert - Fermez le capot de l'imprimante";
+            case Printer.CODE_ERR_CUTTER:
+                return "Erreur du cutter automatique";
+            case Printer.CODE_ERR_MECHANICAL:
+                return "Erreur mécanique de l'imprimante";
+            case Printer.CODE_ERR_EMPTY:
+                return "Plus de papier dans l'imprimante";
+            case Printer.CODE_ERR_UNRECOVERABLE:
+                return "Erreur non récupérable - Redémarrez l'imprimante";
+            case Printer.CODE_ERR_FAILURE:
+                return "Erreur dans la syntaxe du document";
+            case Printer.CODE_ERR_NOT_FOUND:
+                return "Imprimante non trouvée";
+            case Printer.CODE_ERR_SYSTEM:
+                return "Erreur système d'impression";
+            case Printer.CODE_ERR_PORT:
+                return "Erreur de communication sur le port";
+            case Printer.CODE_ERR_TIMEOUT:
+                return "Délai d'impression dépassé";
+            case Printer.CODE_ERR_JOB_NOT_FOUND:
+                return "Travail d'impression non trouvé";
+            case Printer.CODE_ERR_SPOOLER:
+                return "File d'attente d'impression pleine";
+            case Printer.CODE_ERR_BATTERY_LOW:
+                return "Batterie faible";
+            case Printer.CODE_ERR_TOO_MANY_REQUESTS:
+                return "Trop de requêtes d'impression en cours";
+            case Printer.CODE_ERR_REQUEST_ENTITY_TOO_LARGE:
+                return "Données d'impression trop volumineuses";
+            default:
+                return "Erreur d'impression inconnue (code: " + code + ")";
+        }
+    }
+
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
-        Log.d("EpsonPrinterPlugin", "execute called");
-        Log.d("EpsonPrinterPlugin", "Args: " + args.toString());
         if (action.equals("printText")) {
             String toPrint = args.getJSONObject(0).getString("text");
-            Log.d("EpsonPlugin", "Texte reçu pour impression : " + toPrint);
             this.printText(callbackContext, toPrint);
             return true;
         }
@@ -121,12 +297,195 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         return false;
     }
 
-    private void printText(CallbackContext callbackContext, String textToPrint) {
-        Printer printer = null;
+    /**
+     * Initialise l'imprimante si nécessaire
+     */
+    private boolean initializePrinter(Context context) {
+        if (mPrinter != null) {
+            return true;
+        }
         
-        // Diagnostic USB pour debug
-        Context context = cordova.getActivity().getApplicationContext();
+        try {
+            mPrinter = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
+            // Enregistrer le listener AVANT toute opération
+            mPrinter.setReceiveEventListener(this);
+            return true;
+        } catch (Epos2Exception e) {
+            mPrinter = null;
+            return false;
+        }
+    }
+    
+    /**
+     * Connecte l'imprimante
+     */
+    private boolean connectPrinter() {
+        if (mPrinter == null) {
+            return false;
+        }
+        
+        if (isConnected) {
+            // Vérifier que la connexion est toujours valide
+            try {
+                PrinterStatusInfo status = mPrinter.getStatus();
+                if (status != null && status.getConnection() == Printer.TRUE) {
+                    return true;
+                }
+                // La connexion semble perdue, réinitialiser le flag
+                isConnected = false;
+            } catch (Epos2Exception e) {
+                isConnected = false;
+            }
+        }
+        
+        // Tentative de connexion avec retry
+        int maxRetries = 2;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Timeout de connexion augmenté pour plus de stabilité
+                mPrinter.connect("USB:", 15000);
+                isConnected = true;
+                return true;
+            } catch (Epos2Exception e) {
+                int errorCode = e.getErrorStatus();
+                
+                // Si déjà connecté, considérer comme OK
+                if (errorCode == ERR_ALREADY_OPENED) {
+                    isConnected = true;
+                    return true;
+                }
+                
+                // Si c'est une erreur récupérable et qu'on a des retries restants
+                if (attempt < maxRetries && (errorCode == ERR_CONNECT || errorCode == ERR_TIMEOUT)) {
+                    try {
+                        // Petit délai avant de réessayer
+                        Thread.sleep(500);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Déconnecte l'imprimante proprement
+     */
+    private void disconnectPrinter() {
+        if (mPrinter == null || !isConnected) {
+            return;
+        }
+        
+        try {
+            mPrinter.disconnect();
+            isConnected = false;
+        } catch (Epos2Exception e) {
+            isConnected = false;
+        }
+    }
+    
+    /**
+     * Libère complètement les ressources de l'imprimante
+     */
+    private void releasePrinter() {
+        if (mPrinter == null) {
+            return;
+        }
+        
+        try {
+            mPrinter.clearCommandBuffer();
+        } catch (Exception e) {
+            // Ignore error
+        }
+        
+        if (isTransactionActive) {
+            try {
+                mPrinter.endTransaction();
+                isTransactionActive = false;
+            } catch (Exception e) {
+                // Ignore error
+            }
+        }
+        
+        disconnectPrinter();
+        
+        try {
+            mPrinter.setReceiveEventListener(null);
+        } catch (Exception e) {
+            // Ignore error
+        }
+        
+        mPrinter = null;
+    }
+    
+    /**
+     * Nettoyage forcé après timeout du callback (recommandation support Epson)
+     * Appelé quand onPtrReceive n'est pas reçu dans le délai imparti
+     * DOIT effectuer le même nettoyage que onPtrReceive pour éviter ERR_CONNECT
+     */
+    private void forceCleanupAfterTimeout() {
+        Printer printer = mPrinter;
+        
+        // 1. Fin de la transaction
+        try {
+            if (isTransactionActive && printer != null) {
+                printer.endTransaction();
+            }
+        } catch (Exception e) {
+            // Continue cleanup
+        } finally {
+            isTransactionActive = false;
+        }
+        
+        // 2. Déconnexion
+        try {
+            if (printer != null && isConnected) {
+                printer.disconnect();
+            }
+        } catch (Exception e) {
+            // Continue cleanup
+        } finally {
+            isConnected = false;
+        }
+        
+        // 3. Vider le buffer de commandes (nettoie l'état interne du SDK)
+        try {
+            if (printer != null) {
+                printer.clearCommandBuffer();
+            }
+        } catch (Exception e) {
+            // Continue cleanup
+        }
+        
+        // 4. forceRecover() - UNIQUEMENT en cas de timeout (recommandation Support Epson)
+        // forceRecover() est réservé aux situations de récupération après erreur persistante
+        // Le timeout du callback est exactement ce type de situation
+        try {
+            if (printer != null) {
+                printer.forceRecover(3000);
+            }
+        } catch (Exception e) {
+            // Continue cleanup
+        }
+        
+        // Libérer le sémaphore si nécessaire
+        if (shouldReleaseSemaphoreInCallback) {
+            shouldReleaseSemaphoreInCallback = false;
+            printerSemaphore.release();
+        }
+        
+        // Nettoyer les références
+        pendingCallbackContext = null;
+    }
+    
+    /**
+     * Collecte les informations de diagnostic USB
+     */
+    private JSONObject getUsbDiagnostics(Context context) {
+        JSONObject diag = new JSONObject();
         UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+        
         boolean epsonFound = false;
         boolean hasPermission = false;
         String usbDiagnostic = "";
@@ -137,10 +496,8 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
         
         if (usbManager == null) {
             usbDiagnostic = "UsbManager non disponible";
-            Log.e("EpsonPrinterPlugin", "UsbManager est null - service USB indisponible");
         } else if (usbManager.getDeviceList() == null) {
             usbDiagnostic = "Liste USB null";
-            Log.e("EpsonPrinterPlugin", "getDeviceList() retourne null");
         } else {
             usbDeviceCount = usbManager.getDeviceList().size();
             for (UsbDevice device : usbManager.getDeviceList().values()) {
@@ -150,299 +507,477 @@ public class EpsonPrinterPlugin extends CordovaPlugin {
                     epsonProductId = device.getProductId();
                     epsonDeviceName = device.getDeviceName();
                     hasPermission = usbManager.hasPermission(device);
-                    // Vérifier si c'est un PID connu pour TM-T88
                     for (int knownPid : KNOWN_TM_T88_PIDS) {
                         if (epsonProductId == knownPid) {
                             isKnownTmT88 = true;
                             break;
                         }
                     }
-                    Log.d("EpsonPrinterPlugin", "Epson trouvé - Device: " + epsonDeviceName + " PID: 0x" + Integer.toHexString(epsonProductId) + " Permission: " + hasPermission + " TM-T88 connu: " + isKnownTmT88);
                 }
             }
         }
+        
         if (usbDiagnostic.isEmpty()) {
             usbDiagnostic = "Aucun périphérique USB détecté";
         }
         
-        final String finalUsbDiagnostic = usbDiagnostic;
-        final boolean finalEpsonFound = epsonFound;
-        final boolean finalHasPermission = hasPermission;
-        final int finalUsbDeviceCount = usbDeviceCount;
-        final int finalEpsonProductId = epsonProductId;
-        final String finalEpsonDeviceName = epsonDeviceName;
-        final boolean finalIsKnownTmT88 = isKnownTmT88;
-        
         try {
-            Log.d("EpsonPrinterPlugin", "Avant instanciation Printer - USB devices: " + usbDeviceCount + ", Epson trouvé: " + epsonFound + ", Permission: " + hasPermission);
-            printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
-            Log.d("EpsonPrinterPlugin", "Printer instancié");
+            diag.put("epsonDetected", epsonFound);
+            diag.put("usbPermission", hasPermission);
+            diag.put("usbDevices", usbDiagnostic);
+            diag.put("usbDeviceCount", usbDeviceCount);
+            diag.put("epsonProductId", String.format("0x%04X", epsonProductId));
+            diag.put("epsonDeviceName", epsonDeviceName);
+            diag.put("isKnownTmT88", isKnownTmT88);
+        } catch (JSONException e) {
+            // Ignore JSON error
+        }
+        
+        return diag;
+    }
 
-            printer.connect("USB:", Printer.PARAM_DEFAULT);
-            printer.beginTransaction();
-            printer.clearCommandBuffer();
-
-            PrinterStatusInfo status = printer.getStatus();
-            boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
-
-            if (!isOnline) {
-                JSONObject error = new JSONObject();
-                try {
-                    error.put("code", -1);
-                    error.put("message", "Imprimante hors ligne : l'imprimante est connectée mais n'est pas prête à imprimer. Vérifiez le papier, le capot et l'état de l'imprimante");
-                    error.put("context", "printText");
-                    error.put("epsonDetected", finalEpsonFound);
-                    error.put("usbPermission", finalHasPermission);
-                    error.put("usbDevices", finalUsbDiagnostic);
-                    error.put("usbDeviceCount", finalUsbDeviceCount);
-                    error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                    error.put("epsonDeviceName", finalEpsonDeviceName);
-                    error.put("isKnownTmT88", finalIsKnownTmT88);
-                } catch (JSONException e) {
-                    Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
-                }
-                callbackContext.error(error);
-                cleanupPrinter(printer);
-                return;
+    private void printText(final CallbackContext callbackContext, final String textToPrint) {
+        // Exécuter sur un thread séparé car connect/disconnect ne doivent pas être sur le main thread
+        cordova.getThreadPool().execute(new Runnable() {
+            @Override
+            public void run() {
+                printTextInternal(callbackContext, textToPrint);
             }
-
-            Pattern pattern = Pattern.compile("(<BOLD>.*?</BOLD>)|(<QRCODE>.*?</QRCODE>)", Pattern.DOTALL);
-            Matcher matcher = pattern.matcher(textToPrint);
-
-            int lastIndex = 0;
-            while (matcher.find()) {
-                // Texte avant la balise
-                if (matcher.start() > lastIndex) {
-                    String before = textToPrint.substring(lastIndex, matcher.start());
-                    if (!before.isEmpty()) {
-                        printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
-                        printer.addTextAlign(Printer.ALIGN_CENTER);
-                        printer.addText(before);
-                    }
-                }
-
-                String match = matcher.group();
-                if (match.startsWith("<BOLD>")) {
-                    String boldText = match.substring(6, match.length() - 7);
-                    printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.TRUE, Printer.COLOR_1);
-                    printer.addTextAlign(Printer.ALIGN_CENTER);
-                    printer.addText(boldText);
-                } else if (match.startsWith("<QRCODE>")) {
-                    String qrContent = match.substring(8, match.length() - 9);
-                    printer.addTextAlign(Printer.ALIGN_CENTER);
-                    printer.addSymbol(qrContent, Printer.SYMBOL_QRCODE_MODEL_2,
-                            Printer.LEVEL_L, 9, 1, 0);
-                }
-
-                lastIndex = matcher.end();
-            }
-
-            // Texte après la dernière balise
-            if (lastIndex < textToPrint.length()) {
-                String after = textToPrint.substring(lastIndex);
-                if (!after.isEmpty()) {
-                    printer.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
-                    printer.addTextAlign(Printer.ALIGN_CENTER);
-                    printer.addText(after);
-                }
-            }
-
-            printer.addCut(Printer.CUT_FEED);
-            printer.sendData(Printer.PARAM_DEFAULT);
-
-            JSONObject success = new JSONObject();
-            try {
-                success.put("status", "sent");
-                success.put("message", "Impression envoyée");
-                success.put("epsonDetected", finalEpsonFound);
-                success.put("usbPermission", finalHasPermission);
-                success.put("usbDevices", finalUsbDiagnostic);
-                success.put("usbDeviceCount", finalUsbDeviceCount);
-                success.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                success.put("epsonDeviceName", finalEpsonDeviceName);
-                success.put("isKnownTmT88", finalIsKnownTmT88);
-            } catch (JSONException e) {
-                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
-            }
-            callbackContext.success(success);
-
-            printer.setReceiveEventListener(new ReceiveListener() {
-                @Override
-                public void onPtrReceive(Printer printer, int code, PrinterStatusInfo status, String printJobId) {
-                    Log.d("EpsonPrinterPlugin", "Callback reçu, job terminé");
-                    try {
-                        printer.endTransaction();
-                        printer.disconnect();
-                    } catch (Epos2Exception e) {
-                        int errorCode = e.getErrorStatus();
-                        Log.e("EpsonPrinterPlugin", "Erreur callback impression - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode));
-                        callbackContext.error(createErrorResponse(errorCode, "onPtrReceive"));
-                    }
-                }
-            });
-
-        } catch (Epos2Exception e) {
-            int errorCode = e.getErrorStatus();
-            Log.e("EpsonPrinterPlugin", "Erreur impression - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode) + " | USB devices: " + finalUsbDeviceCount + ", Epson: " + finalEpsonFound + ", Permission: " + finalHasPermission + ", DeviceName: " + finalEpsonDeviceName);
-            cleanupPrinter(printer);
-            
+        });
+    }
+    
+    private void printTextInternal(CallbackContext callbackContext, String textToPrint) {
+        Context context = cordova.getActivity().getApplicationContext();
+        JSONObject diagnostics = getUsbDiagnostics(context);
+        
+        // Essayer d'acquérir le sémaphore avec timeout
+        boolean semaphoreAcquired = false;
+        try {
+            semaphoreAcquired = printerSemaphore.tryAcquire(LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        if (!semaphoreAcquired) {
             JSONObject error = new JSONObject();
             try {
-                error.put("code", errorCode);
-                error.put("message", getEpsonErrorMessage(errorCode));
+                error.put("code", ERR_PROCESSING);
+                error.put("message", "Une impression est déjà en cours. Veuillez patienter.");
                 error.put("context", "printText");
-                error.put("epsonDetected", finalEpsonFound);
-                error.put("usbPermission", finalHasPermission);
-                error.put("usbDevices", finalUsbDiagnostic);
-                error.put("usbDeviceCount", finalUsbDeviceCount);
-                error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                error.put("epsonDeviceName", finalEpsonDeviceName);
-                error.put("isKnownTmT88", finalIsKnownTmT88);
-            } catch (JSONException ex) {
-                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
+                mergeJson(error, diagnostics);
+            } catch (JSONException e) {
+                // Ignore JSON error
             }
             callbackContext.error(error);
+            return;
         }
-    }
-
-    /**
-     * Nettoie proprement les ressources de l'imprimante pour éviter les fuites
-     */
-    private void cleanupPrinter(Printer printer) {
-        if (printer == null) return;
-        try {
-            printer.clearCommandBuffer();
-        } catch (Exception ignored) {}
-        try {
-            printer.endTransaction();
-        } catch (Exception ignored) {}
-        try {
-            printer.disconnect();
-        } catch (Exception ignored) {}
-    }
-
-    private void isPrinterAvailable(CallbackContext callbackContext) {
-        // Diagnostic USB avant connexion
-        Context context = cordova.getActivity().getApplicationContext();
-        UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
-        boolean epsonFound = false;
-        boolean hasPermission = false;
-        String usbDiagnostic = "";
-        int usbDeviceCount = 0;
-        int epsonProductId = 0;
-        String epsonDeviceName = "";
-        boolean isKnownTmT88 = false;
         
-        if (usbManager == null) {
-            usbDiagnostic = "UsbManager non disponible";
-            Log.e("EpsonPrinterPlugin", "UsbManager est null - service USB indisponible");
-        } else if (usbManager.getDeviceList() == null) {
-            usbDiagnostic = "Liste USB null";
-            Log.e("EpsonPrinterPlugin", "getDeviceList() retourne null");
-        } else {
-            usbDeviceCount = usbManager.getDeviceList().size();
-            for (UsbDevice device : usbManager.getDeviceList().values()) {
-                usbDiagnostic += String.format("[VID:%04X PID:%04X] ", device.getVendorId(), device.getProductId());
-                if (device.getVendorId() == EPSON_VENDOR_ID) {
-                    epsonFound = true;
-                    epsonProductId = device.getProductId();
-                    epsonDeviceName = device.getDeviceName();
-                    hasPermission = usbManager.hasPermission(device);
-                    // Vérifier si c'est un PID connu pour TM-T88
-                    for (int knownPid : KNOWN_TM_T88_PIDS) {
-                        if (epsonProductId == knownPid) {
-                            isKnownTmT88 = true;
-                            break;
-                        }
-                    }
-                    Log.d("EpsonPrinterPlugin", "Epson trouvé - Device: " + epsonDeviceName + " VID: 0x" + Integer.toHexString(device.getVendorId()) + " PID: 0x" + Integer.toHexString(epsonProductId));
-                    Log.d("EpsonPrinterPlugin", "Permission accordée: " + hasPermission + " | TM-T88 connu: " + isKnownTmT88);
+        try {
+            // Réinitialiser l'état si l'imprimante est dans un état incohérent
+            // (connexion perdue mais objet non nettoyé, ou transaction précédente non terminée)
+            if (mPrinter != null) {
+                if (isTransactionActive || !isConnected) {
+                    releasePrinter();
                 }
             }
-        }
-        
-        if (usbDiagnostic.isEmpty()) {
-            usbDiagnostic = "Aucun périphérique USB détecté";
-        }
-        Log.d("EpsonPrinterPlugin", "Diagnostic USB: " + usbDiagnostic + " | Total devices: " + usbDeviceCount);
-        
-        final String finalUsbDiagnostic = usbDiagnostic;
-        final boolean finalEpsonFound = epsonFound;
-        final boolean finalHasPermission = hasPermission;
-        final int finalUsbDeviceCount = usbDeviceCount;
-        final int finalEpsonProductId = epsonProductId;
-        final String finalEpsonDeviceName = epsonDeviceName;
-        final boolean finalIsKnownTmT88 = isKnownTmT88;
+            
+            // Initialiser l'imprimante si nécessaire
+            if (!initializePrinter(context)) {
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", ERR_FAILURE);
+                    error.put("message", "Impossible d'initialiser l'imprimante");
+                    error.put("context", "printText");
+                    mergeJson(error, diagnostics);
+                } catch (JSONException e) {
+                    // Ignore JSON error
+                }
+                callbackContext.error(error);
+                printerSemaphore.release();
+                return;
+            }
+            
+            // Connecter l'imprimante
+            if (!connectPrinter()) {
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", ERR_CONNECT);
+                    error.put("message", getEpsonErrorMessage(ERR_CONNECT));
+                    error.put("context", "printText");
+                    mergeJson(error, diagnostics);
+                } catch (JSONException e) {
+                    // Ignore JSON error
+                }
+                releasePrinter();
+                callbackContext.error(error);
+                printerSemaphore.release();
+                return;
+            }
+            
+            // Vider le buffer AVANT de démarrer la transaction (selon Epson SDK)
+            try {
+                mPrinter.clearCommandBuffer();
+            } catch (Epos2Exception e) {
+                // Continue anyway
+            }
+            
+            // Vérifier le statut de l'imprimante AVANT la transaction
+            try {
+                PrinterStatusInfo status = mPrinter.getStatus();
+                boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
+                
+                if (!isOnline) {
+                    // NOTE (Support Epson): Ne PAS utiliser forceRecover() dans le flux normal.
+                    // forceRecover() est réservé aux situations de récupération après erreur persistante.
+                    // En cas d'imprimante hors ligne, retourner une erreur claire à l'utilisateur.
+                    JSONObject error = new JSONObject();
+                    try {
+                        error.put("code", -1);
+                        error.put("message", "Imprimante hors ligne : vérifiez le papier, le capot et l'état de l'imprimante");
+                        error.put("context", "printText");
+                        error.put("printerStatus", status != null ? "connection=" + status.getConnection() + ", online=" + status.getOnline() : "null");
+                        mergeJson(error, diagnostics);
+                    } catch (JSONException ex) {
+                        // Ignore JSON error
+                    }
+                    releasePrinter();
+                    callbackContext.error(error);
+                    printerSemaphore.release();
+                    return;
+                }
+            } catch (Epos2Exception e) {
+                // Continuer malgré l'erreur - on essaiera d'imprimer quand même
+            }
+            
+            // Démarrer la transaction APRÈS clearCommandBuffer et vérification statut
+            try {
+                mPrinter.beginTransaction();
+                isTransactionActive = true;
+            } catch (Epos2Exception e) {
+                int errorCode = e.getErrorStatus();
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", errorCode);
+                    error.put("message", getEpsonErrorMessage(errorCode));
+                    error.put("context", "beginTransaction");
+                    mergeJson(error, diagnostics);
+                } catch (JSONException ex) {
+                    // Ignore JSON error
+                }
+                releasePrinter();
+                callbackContext.error(error);
+                printerSemaphore.release();
+                return;
+            }
+            
+            // Préparer les commandes d'impression
+            try {
+                Pattern pattern = Pattern.compile("(<BOLD>.*?</BOLD>)|(<QRCODE>.*?</QRCODE>)", Pattern.DOTALL);
+                Matcher matcher = pattern.matcher(textToPrint);
 
-        Printer printer = null;
+                int lastIndex = 0;
+                while (matcher.find()) {
+                    if (matcher.start() > lastIndex) {
+                        String before = textToPrint.substring(lastIndex, matcher.start());
+                        if (!before.isEmpty()) {
+                            mPrinter.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
+                            mPrinter.addTextAlign(Printer.ALIGN_CENTER);
+                            mPrinter.addText(before);
+                        }
+                    }
+
+                    String match = matcher.group();
+                    if (match.startsWith("<BOLD>")) {
+                        String boldText = match.substring(6, match.length() - 7);
+                        mPrinter.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.TRUE, Printer.COLOR_1);
+                        mPrinter.addTextAlign(Printer.ALIGN_CENTER);
+                        mPrinter.addText(boldText);
+                    } else if (match.startsWith("<QRCODE>")) {
+                        String qrContent = match.substring(8, match.length() - 9);
+                        mPrinter.addTextAlign(Printer.ALIGN_CENTER);
+                        mPrinter.addSymbol(qrContent, Printer.SYMBOL_QRCODE_MODEL_2,
+                                Printer.LEVEL_L, 9, 1, 0);
+                    }
+
+                    lastIndex = matcher.end();
+                }
+
+                if (lastIndex < textToPrint.length()) {
+                    String after = textToPrint.substring(lastIndex);
+                    if (!after.isEmpty()) {
+                        mPrinter.addTextStyle(Printer.FALSE, Printer.FALSE, Printer.FALSE, Printer.COLOR_1);
+                        mPrinter.addTextAlign(Printer.ALIGN_CENTER);
+                        mPrinter.addText(after);
+                    }
+                }
+
+                mPrinter.addCut(Printer.CUT_FEED);
+                
+            } catch (Epos2Exception e) {
+                int errorCode = e.getErrorStatus();
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", errorCode);
+                    error.put("message", getEpsonErrorMessage(errorCode));
+                    error.put("context", "addPrintCommands");
+                    mergeJson(error, diagnostics);
+                } catch (JSONException ex) {
+                    // Ignore JSON error
+                }
+                releasePrinter();
+                callbackContext.error(error);
+                printerSemaphore.release();
+                return;
+            }
+            
+            // Envoyer les données - le callback sera géré dans onPtrReceive
+            // IMPORTANT: stocker le callback AVANT sendData
+            pendingCallbackContext = callbackContext;
+            
+            // Réinitialiser l'indicateur de callback reçu
+            callbackReceived.set(false);
+            
+            try {
+                // Marquer que le sémaphore doit être libéré dans le callback
+                shouldReleaseSemaphoreInCallback = true;
+                
+                // Démarrer le timeout de sécurité AVANT sendData
+                // Si le callback n'est pas reçu dans CALLBACK_TIMEOUT_SECONDS, forcer le nettoyage
+                final CallbackContext timeoutCallback = callbackContext;
+                final JSONObject timeoutDiagnostics = diagnostics;
+                lastSendDataTimestamp = System.currentTimeMillis();
+                
+                callbackTimeoutFuture = timeoutExecutor.schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        // Vérifier si le callback n'a pas été reçu
+                        if (callbackReceived.compareAndSet(false, true)) {
+                            long elapsed = System.currentTimeMillis() - lastSendDataTimestamp;
+                            
+                            // Forcer le nettoyage même sans callback
+                            forceCleanupAfterTimeout();
+                            
+                            // Notifier l'erreur au JavaScript
+                            if (timeoutCallback != null) {
+                                JSONObject error = new JSONObject();
+                                try {
+                                    error.put("code", ERR_TIMEOUT);
+                                    error.put("message", "Timeout: le callback d'impression n'a pas été reçu après " + CALLBACK_TIMEOUT_SECONDS + " secondes. Nettoyage forcé effectué.");
+                                    error.put("context", "callbackTimeout");
+                                    error.put("elapsedMs", elapsed);
+                                    mergeJson(error, timeoutDiagnostics);
+                                } catch (JSONException ex) {
+                                    // Ignore JSON error
+                                }
+                                timeoutCallback.error(error);
+                            }
+                        }
+                    }
+                }, CALLBACK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                
+                // Timeout augmenté pour l'impression
+                mPrinter.sendData(Printer.PARAM_DEFAULT);
+                // NE PAS appeler callbackContext.success() ici !
+                // Le résultat sera notifié dans onPtrReceive
+                // NE PAS libérer le sémaphore ici, il sera libéré dans onPtrReceive
+                
+            } catch (Epos2Exception e) {
+                int errorCode = e.getErrorStatus();
+                
+                // Annuler le timeout car sendData a échoué immédiatement
+                if (callbackTimeoutFuture != null) {
+                    callbackTimeoutFuture.cancel(false);
+                    callbackTimeoutFuture = null;
+                }
+                callbackReceived.set(true); // Marquer comme traité
+                
+                shouldReleaseSemaphoreInCallback = false;
+                pendingCallbackContext = null;
+                
+                JSONObject error = new JSONObject();
+                try {
+                    error.put("code", errorCode);
+                    error.put("message", getEpsonErrorMessage(errorCode));
+                    error.put("context", "sendData");
+                    mergeJson(error, diagnostics);
+                } catch (JSONException ex) {
+                    // Ignore JSON error
+                }
+                releasePrinter();
+                callbackContext.error(error);
+                printerSemaphore.release();
+            }
+            
+        } catch (Exception e) {
+            JSONObject error = new JSONObject();
+            try {
+                error.put("code", ERR_FAILURE);
+                error.put("message", "Erreur inattendue: " + e.getMessage());
+                error.put("context", "printText");
+                mergeJson(error, diagnostics);
+            } catch (JSONException ex) {
+                // Ignore JSON error
+            }
+            
+            shouldReleaseSemaphoreInCallback = false;
+            pendingCallbackContext = null;
+            releasePrinter();
+            callbackContext.error(error);
+            printerSemaphore.release();
+        }
+    }
+    
+    /**
+     * Fusionne deux objets JSON
+     */
+    private void mergeJson(JSONObject target, JSONObject source) {
         try {
-            printer = new Printer(Printer.TM_T88, Printer.MODEL_ANK, cordova.getActivity());
-            printer.connect("USB:", Printer.PARAM_DEFAULT);
-            printer.beginTransaction();
-            printer.clearCommandBuffer();
+            java.util.Iterator<String> keys = source.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                target.put(key, source.get(key));
+            }
+        } catch (JSONException e) {
+            // Ignore merge error
+        }
+    }
 
-            PrinterStatusInfo status = printer.getStatus();
-
+    private void isPrinterAvailable(final CallbackContext callbackContext) {
+        // Exécuter sur un thread séparé car connect/disconnect ne doivent pas être sur le main thread
+        cordova.getThreadPool().execute(new Runnable() {
+            @Override
+            public void run() {
+                isPrinterAvailableInternal(callbackContext);
+            }
+        });
+    }
+    
+    private void isPrinterAvailableInternal(CallbackContext callbackContext) {
+        Context context = cordova.getActivity().getApplicationContext();
+        JSONObject diagnostics = getUsbDiagnostics(context);
+        
+        // Essayer d'acquérir le sémaphore avec timeout court pour la vérification
+        boolean lockAcquired = false;
+        try {
+            lockAcquired = printerSemaphore.tryAcquire(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        if (!lockAcquired) {
+            // Si on ne peut pas acquérir le verrou, une impression est en cours
+            // L'imprimante est donc "disponible" mais occupée
+            JSONObject response = new JSONObject();
+            try {
+                response.put("status", "busy");
+                response.put("message", "Imprimante occupée - une impression est en cours");
+                mergeJson(response, diagnostics);
+            } catch (JSONException e) {
+                // Ignore JSON error
+            }
+            callbackContext.success(response);
+            return;
+        }
+        
+        Printer testPrinter = null;
+        try {
+            testPrinter = new Printer(Printer.TM_T88, Printer.MODEL_ANK, context);
+            testPrinter.connect("USB:", 10000);
+            
+            PrinterStatusInfo status = testPrinter.getStatus();
             boolean isOnline = status != null && status.getConnection() == Printer.TRUE && status.getOnline() == Printer.TRUE;
-
-            cleanupPrinter(printer);
-
+            
+            // Nettoyage immédiat
+            try {
+                testPrinter.disconnect();
+            } catch (Exception e) {
+                // Ignore disconnect error
+            }
+            testPrinter = null;
+            
             if (isOnline) {
                 JSONObject success = new JSONObject();
                 try {
                     success.put("status", "online");
                     success.put("message", "Imprimante disponible et prête");
-                    success.put("epsonDetected", finalEpsonFound);
-                    success.put("usbPermission", finalHasPermission);
-                    success.put("usbDevices", finalUsbDiagnostic);
-                    success.put("usbDeviceCount", finalUsbDeviceCount);
-                    success.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                    success.put("epsonDeviceName", finalEpsonDeviceName);
-                    success.put("isKnownTmT88", finalIsKnownTmT88);
+                    mergeJson(success, diagnostics);
                 } catch (JSONException e) {
-                    Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
+                    // Ignore JSON error
                 }
                 callbackContext.success(success);
             } else {
                 JSONObject error = new JSONObject();
                 try {
                     error.put("code", -1);
-                    error.put("message", "Imprimante hors ligne : l'imprimante est connectée mais n'est pas prête. Vérifiez qu'elle n'est pas en erreur (papier, capot ouvert, etc.)");
+                    error.put("message", "Imprimante hors ligne : vérifiez qu'elle n'est pas en erreur (papier, capot ouvert, etc.)");
                     error.put("context", "isPrinterAvailable");
-                    error.put("epsonDetected", finalEpsonFound);
-                    error.put("usbPermission", finalHasPermission);
-                    error.put("usbDevices", finalUsbDiagnostic);
-                    error.put("usbDeviceCount", finalUsbDeviceCount);
-                    error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                    error.put("epsonDeviceName", finalEpsonDeviceName);
-                    error.put("isKnownTmT88", finalIsKnownTmT88);
+                    mergeJson(error, diagnostics);
                 } catch (JSONException e) {
-                    Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + e.getMessage());
+                    // Ignore JSON error
                 }
                 callbackContext.error(error);
             }
 
         } catch (Epos2Exception e) {
             int errorCode = e.getErrorStatus();
-            Log.e("EpsonPrinterPlugin", "Erreur vérification disponibilité - Code: " + errorCode + " - " + getEpsonErrorMessage(errorCode) + " | USB devices: " + finalUsbDeviceCount + ", Epson: " + finalEpsonFound + ", Permission: " + finalHasPermission + ", DeviceName: " + finalEpsonDeviceName);
-            cleanupPrinter(printer);
+            
+            // Nettoyage en cas d'erreur
+            if (testPrinter != null) {
+                try {
+                    testPrinter.disconnect();
+                } catch (Exception ex) {
+                    // Ignore disconnect error
+                }
+            }
             
             JSONObject error = new JSONObject();
             try {
                 error.put("code", errorCode);
                 error.put("message", getEpsonErrorMessage(errorCode));
                 error.put("context", "isPrinterAvailable");
-                error.put("epsonDetected", finalEpsonFound);
-                error.put("usbPermission", finalHasPermission);
-                error.put("usbDevices", finalUsbDiagnostic);
-                error.put("usbDeviceCount", finalUsbDeviceCount);
-                error.put("epsonProductId", String.format("0x%04X", finalEpsonProductId));
-                error.put("epsonDeviceName", finalEpsonDeviceName);
-                error.put("isKnownTmT88", finalIsKnownTmT88);
+                mergeJson(error, diagnostics);
             } catch (JSONException ex) {
-                Log.e("EpsonPrinterPlugin", "Erreur création JSON: " + ex.getMessage());
+                // Ignore JSON error
             }
             callbackContext.error(error);
+        } finally {
+            printerSemaphore.release();
         }
+    }
+    
+    /**
+     * Appelé lors de la destruction du plugin pour libérer les ressources
+     */
+    @Override
+    public void onDestroy() {
+        // Annuler tout timeout en attente
+        if (callbackTimeoutFuture != null) {
+            callbackTimeoutFuture.cancel(false);
+            callbackTimeoutFuture = null;
+        }
+        
+        // Arrêter l'executor de timeout
+        if (timeoutExecutor != null) {
+            timeoutExecutor.shutdownNow();
+        }
+        
+        releasePrinter();
+        super.onDestroy();
+    }
+    
+    /**
+     * Appelé lors de la mise en pause de l'application
+     */
+    @Override
+    public void onPause(boolean multitasking) {
+        super.onPause(multitasking);
+    }
+    
+    /**
+     * Appelé lors de la reprise de l'application
+     */
+    @Override
+    public void onResume(boolean multitasking) {
+        super.onResume(multitasking);
     }
 }
