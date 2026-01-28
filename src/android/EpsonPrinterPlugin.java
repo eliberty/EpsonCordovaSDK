@@ -287,7 +287,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
                 }
                 // La connexion semble perdue, réinitialiser le flag
                 isConnected = false;
-            } catch (Epos2Exception e) {
+            } catch (Exception e) {
                 isConnected = false;
             }
         }
@@ -334,7 +334,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
         try {
             mPrinter.disconnect();
             isConnected = false;
-        } catch (Epos2Exception e) {
+        } catch (Exception e) {
             isConnected = false;
         }
     }
@@ -571,7 +571,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
             // Vider le buffer AVANT de démarrer la transaction (selon Epson SDK)
             try {
                 mPrinter.clearCommandBuffer();
-            } catch (Epos2Exception e) {
+            } catch (Exception e) {
                 // Continue anyway
             }
             
