@@ -213,7 +213,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
         
         // Notifier le résultat au JavaScript
         if (callback != null) {
-            if (code == Printer.CODE_SUCCESS) {
+            if (code == 0) {
                 JSONObject success = new JSONObject();
                 try {
                     success.put("status", "printed");
@@ -227,7 +227,6 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
                 JSONObject error = new JSONObject();
                 try {
                     error.put("code", code);
-                    error.put("message", getPrintResultMessage(code));
                     error.put("context", "onPtrReceive");
                 } catch (JSONException e) {
                     // Ignore JSON error
@@ -236,52 +235,7 @@ public class EpsonPrinterPlugin extends CordovaPlugin implements ReceiveListener
             }
         }
     }
-    
-    /**
-     * Convertit un code de résultat d'impression en message
-     */
-    private String getPrintResultMessage(int code) {
-        switch (code) {
-            case Printer.CODE_SUCCESS:
-                return "Impression réussie";
-            case Printer.CODE_PRINTING:
-                return "Impression en cours";
-            case Printer.CODE_ERR_AUTORECOVER:
-                return "Erreur récupérable automatiquement - Vérifiez l'imprimante";
-            case Printer.CODE_ERR_COVER_OPEN:
-                return "Capot ouvert - Fermez le capot de l'imprimante";
-            case Printer.CODE_ERR_CUTTER:
-                return "Erreur du cutter automatique";
-            case Printer.CODE_ERR_MECHANICAL:
-                return "Erreur mécanique de l'imprimante";
-            case Printer.CODE_ERR_EMPTY:
-                return "Plus de papier dans l'imprimante";
-            case Printer.CODE_ERR_UNRECOVERABLE:
-                return "Erreur non récupérable - Redémarrez l'imprimante";
-            case Printer.CODE_ERR_FAILURE:
-                return "Erreur dans la syntaxe du document";
-            case Printer.CODE_ERR_NOT_FOUND:
-                return "Imprimante non trouvée";
-            case Printer.CODE_ERR_SYSTEM:
-                return "Erreur système d'impression";
-            case Printer.CODE_ERR_PORT:
-                return "Erreur de communication sur le port";
-            case Printer.CODE_ERR_TIMEOUT:
-                return "Délai d'impression dépassé";
-            case Printer.CODE_ERR_JOB_NOT_FOUND:
-                return "Travail d'impression non trouvé";
-            case Printer.CODE_ERR_SPOOLER:
-                return "File d'attente d'impression pleine";
-            case Printer.CODE_ERR_BATTERY_LOW:
-                return "Batterie faible";
-            case Printer.CODE_ERR_TOO_MANY_REQUESTS:
-                return "Trop de requêtes d'impression en cours";
-            case Printer.CODE_ERR_REQUEST_ENTITY_TOO_LARGE:
-                return "Données d'impression trop volumineuses";
-            default:
-                return "Erreur d'impression inconnue (code: " + code + ")";
-        }
-    }
+
 
     @Override
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) throws JSONException {
